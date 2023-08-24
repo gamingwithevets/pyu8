@@ -3,6 +3,11 @@ if __name__ == '__main__':
 	print('Please use this script as a module.')
 	sys.exit()
 
+import platform
+if sys.version_info < (3, 6, 0, 'alpha', 4):
+	print('This program requires at least Python 3.6.0a4. (You are running Python ', platform.python_version(), ')')
+	sys.exit()
+
 import time
 import ctypes
 import logging
@@ -50,28 +55,20 @@ class PSW_t(ctypes.Union):
 	]
 
 class U8:
-	def __init__(self, rom: bytes, config: int) -> None:
-		if len(rom) < 0xFF: raise CPUError('ROM must be at least 127 words (0xFF bytes)')
-		elif len(rom) % 2 != 0: raise CPUError(f'ROM is of ODD length ({hex(len(self.code_mem))})')
+	def __init__(self, rom: bytes) -> None:
+		if len(rom) != 0x20000: raise CPUError('ROM must be 0x20000 bytes')
 
-		# https://stackoverflow.com/a/14543975
-		self.code_mem_w = bytes([c for t in zip(rom[1::2], rom[::2]) for c in t])
 		self.code_mem = rom
 
-		self.rwind_size = config['rwind_size']
-		self.ro_ranges = config['ro_ranges']
+		self.reset_ptr = self.read_cmem(2, 2)
+		self.reset_brk_ptr = self.read_cmem(4, 2)
 
-		self.reset = False
+		self.nmice_ptr = self.read_cmem(6, 2)
+		self.hwi_ptrs = [self.read_cmem(i, 2) for i in range(0xa, 0x7f, 2)]
+		self.swi_ptrs = [self.read_cmem(i, 2) for i in range(0x80, 0xff, 2)]
 
-		self.reset_el_2_ptr = ctypes.c_uint16(self.concat_bytes(self.code_mem_w[2:4]))
-		self.reset_el_0_ptr = ctypes.c_uint16(self.concat_bytes(self.code_mem_w[4:6]))
-
-		self.nmice_ptr = ctypes.c_uint16(self.concat_bytes(self.code_mem_w[6:8]))
-		self.hwi_ptrs = [ctypes.c_uint16(self.concat_bytes(self.code_mem_w[i:i+2])) for i in range(0xa, 0x7f, 2)]
-		self.swi_ptrs = [ctypes.c_uint16(self.concat_bytes(self.code_mem_w[i:i+2])) for i in range(0x80, 0xff, 2)]
-
-		self.data_mem = rom[:rwind_size]
-		self.data_mem += [0] * (0x10000 - rwind_size)
+		self.ram = [0] * 0xe00
+		self.sfr_mem = [0] * 0x1000
 
 		self.sp = ctypes.c_uint16()
 		self.gr = GR_t()
@@ -88,17 +85,16 @@ class U8:
 		self.ar = ctypes.c_uint16()
 		self.dsr = ctypes.c_uint8()
 
-	def run(self) -> None:
-		self.reset_registers()
-		while True:
-			self.exec_instruction()
-			if self.reset: self.reset_registers()
+		# configurations for step
+		self.dsr_prefix = False
+		self.ea_inc_delay = 0
+		self.mask_cycle = 0
 
-	def reset_registers(self) -> None:
-		self.sp.value = self.concat_bytes(self.code_mem[0:2])
-		for i in range(16): self.gr[i] = self.cr[i] = 0
+	def reset(self) -> None:
+		self.sp.value = self.concat_bytes(self.code_mem[:2])
+		for i in range(16): self.gr.rs[i] = self.cr.rs[i] = 0
 		self.psw.raw = 0
-		self.pc.value = self.addr_filter(self.reset_el_2_ptr.value)
+		self.pc.value = self.reset_ptr & 0xfffe
 		self.csr.value = 0
 		self.lr.value = 0
 		self.elr1.value = self.elr2.value = self.elr2.value = 0
@@ -109,19 +105,38 @@ class U8:
 		self.ar.value = 0
 		self.dsr.value = 0
 
-		self.reset = False
+	def read_cmem(self, addr: int, segment: int = 0):
+		addr &= 0xfffe
+		segment &= 0xe
+		return int.from_bytes(self.code_mem[addr:addr+2], 'little')
 
-	@staticmethod
-	@lru_cache
-	def addr_filter(addr):
-		if type(addr) == int: return addr if addr % 2 == 0 else addr|1
-		elif type(addr) == bytes:
-			last = addr[-1]
-			return addr[:-1] + bytes(last if last % 2 == 0 else last|1)
+	def read_dmem(self, addr: int, bytes_to_fetch: int, segment: int = 0) -> int:
+		addr %= 0x10000
 
-	def read_mem(self, addr: int, bytes_to_fetch: int = 1, little = False) -> int:
-		where2fetch = self.code_mem_w if little else self.code_mem
-		return where2fetch[addr:addr + bytes_to_fetch]
+		fetched_bytes = b''
+		for i in range(addr, addr + bytes_to_fetch):
+			j = i % 0x10000
+			if segment == 0:
+				if j < 0x8000: fetched_bytes += self.code_mem[j].to_bytes(1, 'big')
+				if j < 0x8e00: fetched_bytes += self.ram[j - 0x8000].to_bytes(1, 'big')
+				elif j < 0xf000: fetched_bytes += b'\x00'
+				else: fetched_bytes += self.sfr_mem[j - 0xf000].to_bytes(1, 'big')
+			elif segment == 1: fetched_bytes += self.code_mem[j + 0x10000].to_bytes(1, 'big')
+			elif segment == 8: fetched_bytes += self.code_mem[j].to_bytes(1, 'big')
+
+		return fetched_bytes
+
+	def write_dmem(self, addr: int, bytes_to_write: bytes, segment: int = 0) -> None:
+		addr = addr % 0x10000
+
+		for i in range(bytes_to_write):
+			j = (addr + i) % 0x10000
+			if segment == 0:
+				if j < 0x8000: return
+				if j < 0x8e00: self.ram[j - 0x8000] = bytes_to_write[i]
+				elif j < 0xf000: return
+				else: self.sfr_mem[j - 0xf000] = bytes_to_write[i]
+			else: return
 
 	# https://stackoverflow.com/a/20024864
 	@staticmethod
@@ -134,6 +149,10 @@ class U8:
 
 	@staticmethod
 	@lru_cache
+	def comb_nibbs(data: tuple) -> int: return int(hex(data[0]) + hex(data[1])[2:], 16)
+
+	@staticmethod
+	@lru_cache
 	def get_bits(byte: int, num_bits: int, start_bit: int = 0) -> int: return (byte >> start_bit) & ((1 << num_bits) - 1)
 
 	@staticmethod
@@ -142,115 +161,129 @@ class U8:
 		if len(args) == 1: return int('0x' + ''.join(format(_, "02x") for _ in args[0]), 16)
 		else: return int('0x' + ''.join(format(_, "02x") for _ in args), 16)
 
+	@staticmethod
+	def conv_nibbs(data: bytes) -> tuple: return (data[0] >> 4) & 0xf, data[0] & 0xf, (data[1] >> 4) & 0xf, data[1] & 0xf
+
 	def warn(self, msg): logging.warning(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
+	def err(self, msg): logging.error(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
 
-	def exec_instruction(self) -> None:
-		def warn(): self.warn(f'unimplemented/invalid instruction code {format(self.concat_bytes(ins_code), "04X")}')
+	def step(self) -> None:
+		ins_code_int = self.read_cmem(self.pc.value, self.csr.value)
+		next_instruction = (self.pc.value + 2) & 0xfffe
+	
+		ins_code_raw = ins_code_int.to_bytes(2, 'big')
+		ins_code = self.conv_nibbs(ins_code_raw)
+		decode_index = self.comb_nibbs((ins_code[0], ins_code[3]))
+		n = ins_code[1]
+		m = ins_code[2]
+		immnum = ctypes.c_uint8(ins_code_raw[1]).value
+		adr = self.read_cmem(self.pc.value + 2, self.csr.value)
 
-		self.pc.value = self.addr_filter(self.pc.value)
+		cycle_count = None
+		ea_inc = False
 
-		csr_pc = self.concat_bytes(self.csr.value, self.pc.value)
-		ins_code = self.read_mem(csr_pc, 2, True)
-		next_instruction = csr_pc + 2
+		retval = 0
 
-		dsr_prefix = False
-
-		# === DSR Prefixes ===
-		# DSR <- #imm8
-		if ins_code[0] == 0xe3:
-			dsr_prefix = True
-			self.dsr.value = ins_code[1]
-		# DSR <- Rd
-		if ins_code[0] == 0x90 and self.get_bits(ins_code[1], 4) == 0xf:
-			dsr_prefix = True
-			self.dsr.value = self.gr.rs[self.get_bits(ins_code[1], 4, 4)].value
-		# DSR <- DSR
-		elif ins_code == b'\xfe\x9f': dsr_prefix = True
-
-		if dsr_prefix: next_instruction += 2
-		
-		# CPLC
-		if ins_code == 'b\xfe\xcf': self.psw.field.c = not self.psw.field.c
-		# BRK
-		elif ins_code == b'\xff\xff':
-			if psw['elevel'] > 1: self.reset = True
-			elif psw['elevel'] < 2:
-				self.elr2.value = next_instruction
-				self.ecsr2.value = self.csr.value
-				self.epsw2 = self.psw.raw
-				self.psw.field['elevel'] = 2
-				self.pc.value = self.reset_el_2_ptr
-		# ___ Rn[, Rm]
-		elif self.get_bits(ins_code[0], 4, 4) == 8:
-			n = self.get_bits(ins_code[0], 4)
-			rn = self.gr.rs[n].value
-			rm = self.gr.rs[self.get_bits(ins_code[1], 4, 4)].value
+		if ins_code[0] == 0:
+			# MOV Rn, #imm8
+			cycle_count = 1
+			self.gr.rs[n] = immnum
+			self.psw.field.z = int(immnum == 0)
+			self.psw.field.s = int(immnum < 0)
+		elif ins_code[0] == 1:
+			# ADD Rn, #imm8
+			cycle_count = 1
+			self.gr.rs[n] = self.add(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+		elif ins_code[0] == 2:
+			# AND Rn, #imm8
+			cycle_count = 1
+			self.gr.rs[n] = self._and(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+		elif ins_code[0] == 3:
+			# OR Rn, #imm8
+			cycle_count = 1
+			retval = 2
+		elif ins_code[0] == 4:
+			# XOR Rn, #imm8
+			cycle_count = 1
+			retval = 2
+		elif ins_code[0] == 5:
+			# CMPC Rn, #imm8
+			cycle_count = 1
+			self.subc(self.gr.rs[ins_code[1]], ctypes.c_byte(ins_code[1]).value)
+		elif ins_code[0] == 6:
+			# ADDC Rn, #imm8
+			cycle_count = 1
+			self.gr.rs[n] = self.addc(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+		elif ins_code[0] == 7:
+			# CMP Rn, #imm8
+			cycle_count = 1
+			self.sub(self.gr.rs[ins_code[1]], ctypes.c_byte(ins_code[1]).value)
+		elif decode_index == 0x80:
+			# MOV Rn, Rm
+			cycle_count = 1
+			src = self.gr.rs[m]
+			self.gr.rs[n] = src
+			self.psw.field.z = int(src == 0)
+			self.psw.field.s = int(src < 0)
+		elif decode_index == 0x81:
 			# ADD Rn, Rm
-			if self.get_bits(ins_code[1], 4) == 1: self.gr.rs[n].value = self.add(rn, rm)
+			cycle_count = 1
+			self.gr.rs[n] = self.add(self.gr.rs[n], self.gr.rs[m])
+		elif decode_index == 0x82:
 			# AND Rn, Rm
-			elif self.get_bits(ins_code[1], 4) == 2: self.gr.rs[n].value = self._and(rn, rm)
+			cycle_count = 1
+			self.gr.rs[n] = self._and(self.gr.rs[n], self.gr.rs[m])
+		elif decode_index == 0x83:
+			# OR Rn, Rm
+			retval = 2
+		elif decode_index == 0x84:
+			# XOR Rn, Rm
+			retval = 2
+		elif decode_index == 0x85:
 			# CMPC Rn, Rm
-			elif self.get_bits(ins_code[1], 4) == 5: self.subc(rn, rm)
+			cycle_count = 1
+			self.gr.rs[n] = self.addc(self.gr.rs[n], self.gr.rs[m])
+		elif decode_index == 0x86:
 			# ADDC Rn, Rm
-			elif self.get_bits(ins_code[1], 4) == 6: self.gr.rs[n].value = self.addc(rn, rm)
+			cycle_count = 1
+			self.gr.rs[n] = self.addc(self.gr.rs[n], self.gr.rs[m])
+		elif decode_index == 0x87:
 			# CMP Rn, Rm
-			elif self.get_bits(ins_code[1], 4) == 7: self.sub(rn, rm)
-			# DAA Rn
-			elif ins_code[1] == 0x1f: self.gr.rs[n].value = self.daa(rn)
-			# DAS Rn
-			elif ins_code[1] == 0x3f: self.gr.rs[n].value = self.das(rn)
-		# ___ ERn, ERm
-		elif self.get_bits(ins_code[0], 4, 4) == 0xf:
-			n = self.get_bits(ins_code[0], 4)
-			ern = self.gr.ers[n]
-			erm = self.gr.ers[self.get_bits(ins_code[1], 4, 4)]
-			if ern is not None and erm is not None:
-				# ADD
-				if self.get_bits(ins_code[1], 4) == 6:
-					result = self.add(ern, erm, True)
-					self.set_er(n, result)
-				# CMP
-				elif self.get_bits(ins_code[1], 4) == 7: self.sub(ern, erm, True)
-		# ___ ERn, #imm7
-		elif self.get_bits(ins_code[0], 4, 4) == 0xe and self.get_bits(ins_code[0], 1) == 0:
-			n = self.get_bits(ins_code[0], 4)
-			ern = self.gr.ers[n]; imm7 = self.get_bits(ins_code[1], 7)
-			if ern is not None:
-				# ADD
-				if self.get_bits(ins_code[1], 1, 7) == 1:
-					result = self.add(self.gr.ers[n], imm_7(imm7).value, True)
-					self.set_er(n, result)
-		# ADD Rn, #imm8
-		elif self.get_bits(ins_code[0], 4, 4) == 1:
-			n = self.get_bits(ins_code[0], 4)
-			self.gr.rs[n].value = self.add(self.value, ctypes.c_byte(ins_code[1]).value)
-		# AND Rn, #imm8
-		elif self.get_bits(ins_code[0], 4, 4) == 2:
-			n = self.get_bits(ins_code[0], 4)
-			self.gr.rs[n].value = self._and(self.gr.rs[n].value, ctypes.c_byte(ins_code[1]).value)
-		# CMPC Rn, #imm8
-		elif self.get_bits(ins_code[0], 4, 4) == 5: self.cmpc(self.gr.rs[self.get_bits(ins_code[0], 4)].value, ctypes.c_byte(ins_code[1]).value)
-		# ADDC Rn, #imm8
-		elif self.get_bits(ins_code[0], 4, 4) == 6:
-			n = self.get_bits(ins_code[0], 4)
-			self.gr.rs[n].value = self.addc(self.gr.rs[n].value, ctypes.c_byte(ins_code[1]).value)
-		# CMP Rn, #imm8
-		elif self.get_bits(ins_code[0], 4, 4) == 7: self.sub(self.gr.rs[self.get_bits(ins_code[0], 4)].value, ctypes.c_byte(ins_code[1]).value)
-		# ADD SP, #signed8
-		elif ins_code[0] == 0xe1:
-			signed8 = ins_code[1]
-			self.sp.value = self.add(self.sp.value, ctypes.c_byte(signed8).value, set_psw_ = False)
-		# Bcond Radr/BC cond, Radr
-		elif self.get_bits(ins_code[0], 4, 4) == 0xc:
-			radr = ctypes.c_byte(ins_code[1]).value
+			cycle_count = 1
+			self.sub(self.gr.rs[n], self.gr.rs[m])
+		elif decode_index == 0x8f:
+			if ins_code_int & 0xf11f == 0x810f:
+				# EXTBW ERn
+				retval = 2
+			elif ins_code_int & 0xf0ff == 0x801f:
+				# DAA Rn
+				cycle_count = 1
+				self.gr.rs[n] = self.daa(rn)
+			elif ins_code_int & 0xf0ff == 0x803f:
+				# DAA Rn
+				cycle_count = 1
+				self.gr.rs[n] = self.das(rn)
+			elif ins_code_int & 0xf0ff == 0x805f:
+				# NEG Rn
+				cycle_count = 1
+				retval = 2
+			else: retval = 1
+		elif decode_index == 0x9f:
+			if ins_code_int & 0xf00 != 0: retval = 1
+			else:
+				# [DSR prefix] DSR <- Rd
+				self.dsr.value = self.gr.rs[m]
+				dsr_prefix = True
+				cycle_count = 1
+		elif ins_code[0] == 0xc:
 			cond = False
-			cond_hex = self.get_bits(ins_code[0], 4)
+			cond_hex = ins_code[1]
 			# GE/NC
 			if cond_hex == 0: cond = self.psw.field.c == 0
 			# LT/CY
 			elif cond_hex == 1: cond = self.psw.field.c == 1
 			# GT
-			elif cond_hex == 2: cond = self.psw.field.c == psw['z'] == 0
+			elif cond_hex == 2: cond = self.psw.field.c == self.psw['z'] == 0
 			# LE
 			elif cond_hex == 3: cond = self.psw.field.z == 1 or self.psw.field.c == 1
 			# GES
@@ -275,47 +308,218 @@ class U8:
 			elif cond_hex == 0xd: cond = self.psw.field.s == 1
 			# AL
 			elif cond_hex == 0xe: cond = True
-			else: warn()
-			if cond: self.pc.value += radr
-		elif self.get_bits(ins_code[0], 4, 4) == 0xf:
-			# B Cadr
-			if ins_code[1] == 0:
-				self.csr.value = self.get_bits(ins_code[0], 4)
-				next_instruction = self.read_mem(csr_pc + 2, 2)
-			# BL Cadr
-			if ins_code[1] == 1:
+			else: retval = 1
+			if cond:
+				self.pc.value += immnum * 2
+				cycle_count = 3
+			else: cycle_count = 1
+		elif ins_code[0] == 0xe:
+			if ins_code_int & 0x180 == 0:
+				# MOV ERn, #imm7
+				cycle_count = 2
+				retval = 2
+			elif ins_code_int & 0x180 == 0x80:
+				# MOV ERn, #imm7
+				cycle_count = 2
+				self.gr.ers[n//2] = self.add(self.gr.ers[n//2], imm_7(self.get_bits(ins_code[1], 7)).value, True)
+			elif ins_code[1] == 1:
+				# ADD SP, #signed8
+				self.sp.value += ctypes.c_byte(immnum).value
+				cycle_count = 2
+			elif ins_code[1] == 3:
+				# [DSR prefix] DSR <- #imm8
+				dsr_prefix = True
+				self.dsr.value = ins_code[1]
+				cycle_count = 1
+			elif ins_code[1] == 5:
+				# SWI #snum
+				retval = 2
+			elif ins_code[1] == 9:
+				# MOV PSW, #unsigned8
+				self.psw.raw = immnum
+				cycle_count = 1
+			elif ins_code[1] == 0xb:
+				if ins_code_raw[1] == 0x7f:
+					# RC
+					self.psw.field.c = 0
+					cycle_count = 1
+				elif ins_code_raw[1] == 0xf7:
+					# DI
+					self.psw.field.mie = 0
+					cycle_count = 3
+				else: retval = 1
+			elif ins_code[1] == 0xd:
+				if ins_code_raw[1] == 8:
+					# EI
+					self.psw.field.mie = 1
+					cycle_count = 3
+					# TODO: Disable maskable interrupts for 2 cycles
+				elif ins_code_raw[1] == 0x80:
+					# SC
+					self.psw.field.c = 1
+					cycle_count = 1
+				else: retval = 1
+			else: retval = 1
+		elif decode_index == 0xf0:
+			if ins_code_int & 0xf0 != 0: retval = 1
+			else:
+				# B Cadr
+				self.csr.value = ins_code[1]
+				self.pc.value = adr
+				cycle_count = 2 + self.ea_inc_delay
+		elif decode_index == 0xf1:
+			if ins_code_int & 0xf0 != 0: retval = 1
+			else:
+				# BL Cadr
 				self.lr.value = next_instruction + 2
 				self.lcsr.value = self.csr.value
-				self.csr.value = self.get_bits(ins_code[0], 4)
-				next_instruction = self.read_mem(csr_pc + 2, 2)
-		elif ins_code[0] == 0xf0:
-			# B ERn
-			if self.get_bits(ins_code[1], 4) == 2: self.pc.value = self.gr.ers[self.get_bits(ins_code[1], 4, 4)]
-			# BL ERn
-			elif self.get_bits(ins_code[1], 4) == 3:
-				next_instruction = self.gr.ers[self.get_bits(ins_code[1], 4, 4)]
+				self.csr.value = ins_code[1]
+				self.pc.value = adr
+				cycle_count = 2 + self.ea_inc_delay
+		elif decode_index == 0xf2:
+			if ins_code_int & 0xf10 != 0: retval = 1
+			else:
+				# B ERn
+				self.pc.value = self.gr.ers[m//2]
+				cycle_count = 2 + self.ea_inc_delay
+		elif decode_index == 0xf3:
+			if ins_code_int & 0xf10 != 0: retval = 1
+			else:
+				# BL ERn
+				self.pc.value = self.gr.ers[m//2]
 				self.lr.value = next_instruction
 				self.lcsr.value = self.csr.value
-		else: warn()
+				cycle_count = 2 + self.ea_inc_delay
+		elif decode_index == 0xf4:
+			if ins_code_int & 0x100 != 0: retval = 1
+			else:
+				# MUL ERn, Rm
+				retval = 2
+		elif decode_index == 0xf5:
+			if ins_code_int & 0x110 != 0: retval = 1
+			else:
+				# MOV ERn, ERm
+				retval = 2
+		elif decode_index == 0xf6:
+			if ins_code_int & 0x110 != 0: retval = 1
+			else:
+				# ADD ERn, ERm
+				self.gr.ers[n//2] = self.add(self.gr.ers[n//2], self.gr.ers[m//2], True)
+				cycle_count = 2
+		elif decode_index == 0xf7:
+			if ins_code_int & 0x110 != 0: retval = 1
+			else:
+				# CMP ERn, ERm
+				self.sub(self.gr.ers[n//2], self.gr.ers[m//2], True)
+				cycle_count = 2
+		elif decode_index == 0xf9:
+			if ins_code_int & 0x100 != 0: retval = 1
+			else:
+				# DIV ERn, Rm
+				retval = 2
+		elif decode_index == 0xfa:
+			if ins_code_int & 0x10 != 0: retval = 1
+			else:
+				# LEA [ERm]
+				retval = 2
+		elif decode_index == 0xfb:
+			if ins_code_int & 0x10 != 0: retval = 1
+			else:
+				# LEA Disp16[ERm]
+				retval = 2
+		elif decode_index == 0xfc:
+			if ins_code_int & 0x10 != 0: retval = 1
+			else:
+				# LEA Dadr
+				retval = 2
+		elif decode_index == 0xfd:
+			# MOV CRn, [EA]
+			# MOV CRn, [EA+]
+			# MOV CERn, [EA]
+			# MOV CERn, [EA+]
+			# MOV CXRn, [EA]
+			# MOV CXRn, [EA+]
+			# MOV CQRn, [EA]
+			# MOV CQRn, [EA+]
+			# MOV [EA], CRm
+			# MOV [EA+], CRm
+			# MOV [EA], CERm
+			# MOV [EA+], CERm
+			# MOV [EA], CXRm
+			# MOV [EA+], CXRm
+			# MOV [EA], CQRm
+			# MOV [EA+], CQRm
+			retval = 2
+		elif decode_index == 0xfe:
+			# PUSH/POP
+			retval = 2
+		elif decode_index == 0xff:
+			if ins_code_int & 0x10 != 0: retval = 1
+			else:
+				if ins_code_int == 0xfe0f:
+					# RTI
+					retval = 2
+				elif ins_code_int == 0xfe1f:
+					# RT
+					retval = 2
+				elif ins_code_int == 0xfe2f:
+					# INC [EA]
+					seg = self.dsr.value if self.dsr_prefix else 0
+					currval = self.read_dmem(self.ea.value, 1, seg)
+					self.write_dmem(self.ea.value, (currval+1).to_bytes(1, 'big'), seg)
+				elif ins_code_int == 0xfe3f:
+					# DEC [EA]
+					seg = self.dsr.value if self.dsr_prefix else 0
+					currval = self.read_dmem(self.ea.value, 1, seg)
+					self.write_dmem(self.ea.value, (currval-1).to_bytes(1, 'big'), seg)
+				elif ins_code_int == 0xfe8f:
+					# NOP
+					cycle_count = 1
+				elif ins_code_int == 0xfe9f:
+					# [DSR prefix] DSR <- DSR
+					dsr_prefix = True
+					cycle_count = 1
+				elif ins_code_int == 0xfecf:
+					# CPLC
+					self.psw.field.c ^= 1
+					cycle_count = 1
+				elif ins_code_int == 0xffff:
+					# BRK
+					if self.psw.field.elevel > 1: self.reset_registers()
+					else:
+						self.elr2.value = next_instruction
+						self.ecsr2.value = self.csr.value
+						self.epsw2 = self.psw.raw
+						self.psw.field.elevel = 2
+						self.pc.value = self.reset_brk_ptr
+						cycle_count = 7
+				else: retval = 1
+		else: retval = 2
+
+		if retval == 0:
+			self.ea_inc_delay = 1 if ea_inc else 0
+
+			self.mask_cycle -= cycle_count
+			if self.mask_cycle < 0: self.mask_cycle = 0
+
+			if self.dsr_prefix and self.mask_cycle == 0: self.mask_cycle += 1
 
 		self.pc.value = next_instruction
+		return retval
 
-	def add(self, op1: int, op2: int, short: bool = False, set_psw_: bool = True):
-		ctype = ctypes.c_short if short else ctypes.c_byte
+	def add(self, op1: int, op2: int, short: bool = False):
+		ctype = ctypes.c_uint16 if short else ctypes.c_uint8
 
-		result = ctype(op1 + op2).value
-		carry = (result >> 15) & 1 if short else (result >> 7) & 1
-		overflow = result < op1
+		result = op1 + op2
 		half_carry = ((result >> 11) & 1 or (result & (1 << 11)) >> 11) if short else ((result >> 3) & 1 or (result & (1 << 3)) >> 3)
 
-		if set_psw_:
-			self.psw.field.c = int(carry)
-			self.psw.field.z = int(result == 0)
-			self.psw.field.s = int(result < 0)
-			self.psw.field.ov = int(overflow)
-			self.psw.field.hc = int(half_carry)
+		self.psw.field.c = 1 int(result & (0x10000 if short else 0xff))
+		self.psw.field.z = int(result == 0)
+		self.psw.field.s = int(result < 0)
+		self.psw.field.ov = int(result < op1)
+		self.psw.field.hc = int(half_carry)
 	
-		return result
+		return ctype(result).value
 
 	def addc(self, op1: int, op2: int):
 		result = ctypes.c_byte(op1 + op2 + self.psw.field.c).value
@@ -340,7 +544,7 @@ class U8:
 		return result
 
 	def sub(self, op1: int, op2: int, short: bool = False):
-		ctype = ctypes.c_short if short else ctypes.c_byte
+		ctype = ctypes.c_uint16 if short else ctypes.c_uint8
 
 		result = ctype(op1 - op2).value
 		carry = (result >> 15) & 1 if short else (result >> 7) & 1
@@ -373,7 +577,6 @@ class U8:
 		split = self.split_nibble(op1)
 
 		result_orig = op1
-		carry = self.psw.field.c
 
 		if self.psw.field.c == 0:
 			if split[0] in range(10):
@@ -381,24 +584,24 @@ class U8:
 				elif self.psw.field.hc == 1: result_orig += 6
 			elif split[0] in range(9) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig += 6
 			elif split[0] in range(10, 16):
-				if self.psw.field.hc == 0 and split[1] in range(10): result_orig += 0x60; carry = 1
-				elif self.psw.field.hc == 1: result_orig += 0x66; carry = 1
-			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig += 0x66; carry = 1
+				if self.psw.field.hc == 0 and split[1] in range(10): result_orig += 0x60
+				elif self.psw.field.hc == 1: result_orig += 0x66
+			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig += 0x66
 		elif self.psw.field.c == 1:
 			if self.psw.field.hc == 0:
 				if split[1] in range(10): result_orig += 0x60
 				elif split[1] in range(10, 16): result_orig += 0x66
-			elif self.psw.field.hc == 1: result_orig += 66
+			elif self.psw.field.hc == 1: result_orig += 0x66
 
-		result = ctypes.c_byte(result_orig).value
+		result = result_orig
 		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
 
-		self.psw.field.c = int(carry)
+		if result > 0xff: self.psw.field.c = 1
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
 		self.psw.field.hc = int(half_carry)
 
-		return result
+		return ctypes.c_byte(result).value
 
 	def das(self, op1: int):
 		split = self.split_nibble(op1)
@@ -420,15 +623,14 @@ class U8:
 			if self.psw.field.hc == 0:
 				if split[1] in range(10): result_orig -= 0x60
 				elif split[1] in range(10, 16): result_orig -= 0x66
-			elif self.psw.field.hc == 1: result_orig += 66
+			elif self.psw.field.hc == 1: result_orig -= 0x66
 
-		result = ctypes.c_byte(result_orig).value
-		carry = result_orig > 0xff
+		result = result_orig
 		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
 
-		self.psw.field.c = int(carry)
+		if result > 0xff: self.psw.field.c = 1
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
 		self.psw.field.hc = int(half_carry)
 
-		return result
+		return ctypes.c_byte(result).value
