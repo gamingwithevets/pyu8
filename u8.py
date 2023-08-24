@@ -23,7 +23,7 @@ class uint_4(ctypes.Structure):
 	def __str__(self): return str(self.value)
 
 class imm_7(ctypes.Structure):
-	_fields_ = [('value', ctypes.c_byte, 7)]
+	_fields_ = [('value', ctypes.c_int8, 7)]
 
 	def __init__(self, value: int = 0): self.value = value & 0x7f
 	def __repr__(self): return f'imm_7({self.value})'
@@ -193,11 +193,11 @@ class U8:
 		elif ins_code[0] == 1:
 			# ADD Rn, #imm8
 			cycle_count = 1
-			self.gr.rs[n] = self.add(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+			self.gr.rs[n] = self.add(self.gr.rs[n], ctypes.c_int8(ins_code[1]).value)
 		elif ins_code[0] == 2:
 			# AND Rn, #imm8
 			cycle_count = 1
-			self.gr.rs[n] = self._and(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+			self.gr.rs[n] = self._and(self.gr.rs[n], ctypes.c_int8(ins_code[1]).value)
 		elif ins_code[0] == 3:
 			# OR Rn, #imm8
 			cycle_count = 1
@@ -209,15 +209,15 @@ class U8:
 		elif ins_code[0] == 5:
 			# CMPC Rn, #imm8
 			cycle_count = 1
-			self.subc(self.gr.rs[ins_code[1]], ctypes.c_byte(ins_code[1]).value)
+			self.subc(self.gr.rs[ins_code[1]], ctypes.c_int8(ins_code[1]).value)
 		elif ins_code[0] == 6:
 			# ADDC Rn, #imm8
 			cycle_count = 1
-			self.gr.rs[n] = self.addc(self.gr.rs[n], ctypes.c_byte(ins_code[1]).value)
+			self.gr.rs[n] = self.addc(self.gr.rs[n], ctypes.c_int8(ins_code[1]).value)
 		elif ins_code[0] == 7:
 			# CMP Rn, #imm8
 			cycle_count = 1
-			self.sub(self.gr.rs[ins_code[1]], ctypes.c_byte(ins_code[1]).value)
+			self.sub(self.gr.rs[ins_code[1]], ctypes.c_int8(ins_code[1]).value)
 		elif decode_index == 0x80:
 			# MOV Rn, Rm
 			cycle_count = 1
@@ -324,7 +324,7 @@ class U8:
 				self.gr.ers[n//2] = self.add(self.gr.ers[n//2], imm_7(self.get_bits(ins_code[1], 7)).value, True)
 			elif ins_code[1] == 1:
 				# ADD SP, #signed8
-				self.sp.value += ctypes.c_byte(immnum).value
+				self.sp.value += ctypes.c_int8(immnum).value
 				cycle_count = 2
 			elif ins_code[1] == 3:
 				# [DSR prefix] DSR <- #imm8
@@ -508,35 +508,34 @@ class U8:
 		return retval
 
 	def add(self, op1: int, op2: int, short: bool = False):
-		ctype = ctypes.c_uint16 if short else ctypes.c_uint8
+		ctype = ctypes.c_int16 if short else ctypes.c_int8
 
-		result = op1 + op2
-		half_carry = ((result >> 11) & 1 or (result & (1 << 11)) >> 11) if short else ((result >> 3) & 1 or (result & (1 << 3)) >> 3)
+		result_raw = op1 + op2
+		result = ctype(result_raw).value
 
-		self.psw.field.c = 1 int(result & (0x10000 if short else 0xff))
+		self.psw.field.c = int(result_raw & (0x10000 if short else 0xff))
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = int(result < op1)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		hc_val = 0xfff if short else 0xf
+		self.psw.field.hc = int((((op2 & hc_val) + (op1 & hc_val)) & (hc_val+1)))
 	
-		return ctype(result).value
+		return result
 
 	def addc(self, op1: int, op2: int):
-		result = ctypes.c_byte(op1 + op2 + self.psw.field.c).value
-		carry = (result >> 7) & 1
-		overflow = result < op1
-		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
+		result_raw = op1 + op2 + self.psw.field.c
+		result = ctypes.c_int8(result_raw).value
 
-		self.psw.field.c = int(carry)
-		self.psw.field.z = int(self.psw.field.z == 1 and result == 0)
+		self.psw.field.c = int(result_raw & 0xff)
+		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = int(overflow)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
 		return result
 
 	def _and(self, op1: int, op2: int):
-		result = ctypes.c_byte(op1 & op2).value
+		result = ctypes.c_int8(op1 & op2).value
 
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
@@ -544,93 +543,88 @@ class U8:
 		return result
 
 	def sub(self, op1: int, op2: int, short: bool = False):
-		ctype = ctypes.c_uint16 if short else ctypes.c_uint8
+		ctype = ctypes.c_int16 if short else ctypes.c_int8
 
-		result = ctype(op1 - op2).value
-		carry = (result >> 15) & 1 if short else (result >> 7) & 1
-		overflow = result < op1
-		half_carry = ((result >> 11) & 1 or (result & (1 << 11)) >> 11) if short else ((result >> 3) & 1 or (result & (1 << 3)) >> 3)
+		result_raw = op1 - op2
+		result = ctype(result_raw).value
 
-		self.psw.field.c = int(carry)
+		self.psw.field.c = int(result_raw & (0x10000 if short else 0xff))
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = int(overflow)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		hc_val = 0xfff if short else 0xf
+		self.psw.field.hc = int((((op2 & hc_val) + (op1 & hc_val)) & (hc_val+1)))
 
 		return result
 
 	def subc(self, op1: int, op2: int):
-		result = ctypes.c_short(op1 - op2 - self.psw.field.c).value
-		carry = (result >> 15) & 1
-		overflow = result < op1
-		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
+		result_raw = op1 - op2 - self.psw.field.c
+		result = ctypes.c_short(result_raw).value
 
-		self.psw.field.c = int(carry)
-		self.psw.field.z = int(self.psw.field.z == 1 and result == 0)
+		self.psw.field.c = int(result_raw & 0xff)
+		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = int(overflow)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
 		return result
 
 	def daa(self, op1: int):
 		split = self.split_nibble(op1)
 
-		result_orig = op1
+		result = op1
 
 		if self.psw.field.c == 0:
 			if split[0] in range(10):
-				if self.psw.field.hc == 0 and split[1] in range(10): result_orig += 0
-				elif self.psw.field.hc == 1: result_orig += 6
-			elif split[0] in range(9) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig += 6
+				if self.psw.field.hc == 0 and split[1] in range(10): result += 0
+				elif self.psw.field.hc == 1: result += 6
+			elif split[0] in range(9) and self.psw.field.hc == 0 and split[1] in range(10, 16): result += 6
 			elif split[0] in range(10, 16):
-				if self.psw.field.hc == 0 and split[1] in range(10): result_orig += 0x60
-				elif self.psw.field.hc == 1: result_orig += 0x66
-			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig += 0x66
+				if self.psw.field.hc == 0 and split[1] in range(10): result += 0x60
+				elif self.psw.field.hc == 1: result += 0x66
+			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result += 0x66
 		elif self.psw.field.c == 1:
 			if self.psw.field.hc == 0:
-				if split[1] in range(10): result_orig += 0x60
-				elif split[1] in range(10, 16): result_orig += 0x66
-			elif self.psw.field.hc == 1: result_orig += 0x66
+				if split[1] in range(10): result += 0x60
+				elif split[1] in range(10, 16): result += 0x66
+			elif self.psw.field.hc == 1: result += 0x66
 
-		result = result_orig
-		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
-
+		result = ctypes.c_int8(result).value
+	
 		if result > 0xff: self.psw.field.c = 1
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
-		return ctypes.c_byte(result).value
+		return result
 
 	def das(self, op1: int):
 		split = self.split_nibble(op1)
 
-		result_orig = op1
+		result = op1
 
 		if self.psw.field.c == 0:
 			if split[0] in range(10):
-				if self.psw.field.hc == 0 and split[1] in range(10): result_orig -= 0
-				elif self.psw.field.hc == 1: result_orig -= 6
-			elif split[0] in range(9) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig -= 6
+				if self.psw.field.hc == 0 and split[1] in range(10): result -= 0
+				elif self.psw.field.hc == 1: result -= 6
+			elif split[0] in range(9) and self.psw.field.hc == 0 and split[1] in range(10, 16): result -= 6
 			elif split[0] in range(10, 16):
 				if self.psw.field.hc == 0:
-					if split[1] in range(10): result_orig -= 0x60
-					elif split[1] in range(10, 16): result_orig -= 0x66
-				elif self.psw.field.hc == 1: result_orig += 0x66
-			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result_orig -= 0x66
+					if split[1] in range(10): result -= 0x60
+					elif split[1] in range(10, 16): result -= 0x66
+				elif self.psw.field.hc == 1: result += 0x66
+			elif split[0] in range(9, 16) and self.psw.field.hc == 0 and split[1] in range(10, 16): result -= 0x66
 		elif self.psw.field.c == 1:
 			if self.psw.field.hc == 0:
-				if split[1] in range(10): result_orig -= 0x60
-				elif split[1] in range(10, 16): result_orig -= 0x66
-			elif self.psw.field.hc == 1: result_orig -= 0x66
+				if split[1] in range(10): result -= 0x60
+				elif split[1] in range(10, 16): result -= 0x66
+			elif self.psw.field.hc == 1: result -= 0x66
 
-		result = result_orig
-		half_carry = (result >> 3) & 1 or (result & (1 << 3)) >> 3
+		result = ctypes.c_int8(result).value
 
 		if result > 0xff: self.psw.field.c = 1
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.hc = int(half_carry)
+		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
-		return ctypes.c_byte(result).value
+		return result
