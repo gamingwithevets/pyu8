@@ -125,7 +125,7 @@ class U8:
 				elif j < 0xf000: fetched_bytes += b'\x00'
 				else: fetched_bytes += self.sfr_mem[j - 0xf000].to_bytes(1, 'big')
 			elif segment == 1: fetched_bytes += self.code_mem[j + 0x10000].to_bytes(1, 'big')
-			elif segment == 8: fetched_bytes += self.code_mem[j].to_bytes(1, 'big')
+			else: fetched_bytes += b'\xff'
 
 		return fetched_bytes
 
@@ -170,6 +170,8 @@ class U8:
 	def warn(self, msg): logging.warning(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
 	def err(self, msg): logging.error(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
 
+	def get_dsr_prefix(self): return self.dsr.value if self.dsr_prefix else 0
+
 	def step(self) -> None:
 		ins_code_int = self.read_cmem(self.pc.value, self.csr.value)
 		self.pc.value = (self.pc.value + 2) & 0xfffe
@@ -180,7 +182,7 @@ class U8:
 		n = ins_code[1]
 		m = ins_code[2]
 		immnum = ctypes.c_uint8(ins_code_raw[1]).value
-		adr = self.read_cmem(self.pc.value + 2, self.csr.value)
+		adr = self.read_cmem(self.pc.value, self.csr.value)
 
 		cycle_count = 0
 		ea_inc = False
@@ -276,12 +278,12 @@ class U8:
 			if ins_code_int & 0x10 == 0:
 				# L Rn, [ERm]
 				src = self.gr.ers[m]
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9010:
 				# L Rn, Dadr
 				self.pc.value += 2
 				src = adr
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9030:
 				# L Rn, [EA]
 				src = self.ea.value
@@ -292,7 +294,7 @@ class U8:
 			else: retval = 1
 
 			if src is not None:
-				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)[0]
+				val = self.read_dmem(src, 1, self.get_dsr_prefix())[0]
 				self.dsr_prefix = False
 				cycle_count += 1 + self.romwin_acc
 
@@ -304,12 +306,12 @@ class U8:
 			if ins_code_int & 0x10 == 0:
 				# ST Rn, [ERm]
 				dest = self.gr.ers[m]
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9011:
 				# ST Rn, Dadr
 				self.pc.value += 2
 				dest = adr
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9031:
 				# ST Rn, [EA]
 				dest = self.ea.value
@@ -320,7 +322,7 @@ class U8:
 			else: retval = 1
 
 			if dest is not None:
-				val = self.write_dmem(dest, self.gr[n].to_bytes(1, 'big'), self.dsr.value if self.dsr_prefix else 0)
+				val = self.write_dmem(dest, self.gr.rs[n].to_bytes(1, 'big'), self.get_dsr_prefix())
 				self.dsr_prefix = False
 				cycle_count += 1
 		elif decode_index == 0x92:
@@ -328,45 +330,47 @@ class U8:
 			if ins_code_int & 0x10 == 0:
 				# L ERn, [ERm]
 				src = self.gr.ers[m]
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf1ff == 0x9012:
 				# L ERn, Dadr
 				self.pc.value += 2
 				src = adr
-				cycle_count += ea_inc_delay
+				cycle_count += self.ea_inc_delay
 			elif ins_code_int & 0xf1ff == 0x9032:
 				# L ERn, [EA]
 				src = self.ea.value
 			elif ins_code_int & 0xf1ff == 0x9052:
 				# L ERn, [EA+]
 				src = self.ea.value
-				self.ea.value += 1; ea_inc = True
+				self.ea.value += 2; ea_inc = True
 			else: retval = 1
 
 			if src is not None:
-				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)[0]
+				val = int.from_bytes(self.read_dmem(src, 2, self.get_dsr_prefix()), 'little')
 				self.dsr_prefix = False
 				cycle_count += 1 + self.romwin_acc
 
 				if val == 0: self.psw.z = 1
-				elif val > 0x7f: self.psw.s = 1
+				elif val > 0x7fff: self.psw.s = 1
 				self.gr.ers[n] = val
 		elif decode_index == 0x9f:
 			if ins_code_int & 0xf00 != 0: retval = 1
 			else:
 				# [DSR prefix] DSR <- Rd
 				self.dsr.value = self.gr.rs[m]
-				dsr_prefix = True
+				self.dsr_prefix = True
 				cycle_count = 1
 		elif decode_index == 0xa1:
 			bit = n & 0x7
+			byte = None
 			if ins_code_int & 0x80 != 0:
 				if ins_code_int & 0xf80 != 0x80: retval = 1
 				else:
 					# TB Dbitadr
-					byte = self.read_dmem(adr, 1, self.dsr.value if self.dsr_prefix else 0)
-			else:
+					byte = self.read_dmem(adr, 1, )[0]
+			else: byte = self.gr.rs[m]
 
+			if byte is not None: self.psw.z = 0 if byte & (1 << bit) else 1
 		elif ins_code[0] == 0xc:
 			cond = False
 			cond_hex = ins_code[1]
@@ -411,16 +415,16 @@ class U8:
 				cycle_count = 2
 				retval = 2
 			elif ins_code_int & 0x180 == 0x80:
-				# MOV ERn, #imm7
+				# ADD ERn, #imm7
 				cycle_count = 2
-				self.gr.ers[n//2] = self.add(self.gr.ers[n//2], imm_7(self.get_bits(ins_code[1], 7)).value, True)
+				self.gr.ers[n//2] = self.add(self.gr.ers[n//2], imm_7(immnum & 0x7f).value, True)
 			elif ins_code[1] == 1:
 				# ADD SP, #signed8
 				self.sp.value += ctypes.c_int8(immnum).value
 				cycle_count = 2
 			elif ins_code[1] == 3:
 				# [DSR prefix] DSR <- #imm8
-				dsr_prefix = True
+				self.dsr_prefix = True
 				self.dsr.value = ins_code[1]
 				cycle_count = 1
 			elif ins_code[1] == 5:
@@ -524,7 +528,7 @@ class U8:
 			else:
 				# LEA Dadr
 				self.ea.value = adr
-				self.pc.value = self.pc2
+				self.pc.value += 2
 				cycle_count = 2
 		elif decode_index == 0xfd:
 			# MOV CRn, [EA]
@@ -558,20 +562,18 @@ class U8:
 					retval = 2
 				elif ins_code_int == 0xfe2f:
 					# INC [EA]
-					seg = self.dsr.value if self.dsr_prefix else 0
-					currval = self.read_dmem(self.ea.value, 1, seg)[0]
+					currval = self.read_dmem(self.ea.value, 1, self.get_dsr_prefix())[0]
 					self.write_dmem(self.ea.value, (currval+1).to_bytes(1, 'big'), seg)
 				elif ins_code_int == 0xfe3f:
 					# DEC [EA]
-					seg = self.dsr.value if self.dsr_prefix else 0
-					currval = self.read_dmem(self.ea.value, 1, seg)[0]
+					currval = self.read_dmem(self.ea.value, 1, self.get_dsr_prefix())[0]
 					self.write_dmem(self.ea.value, (currval-1).to_bytes(1, 'big'), seg)
 				elif ins_code_int == 0xfe8f:
 					# NOP
 					cycle_count = 1
 				elif ins_code_int == 0xfe9f:
 					# [DSR prefix] DSR <- DSR
-					dsr_prefix = True
+					self.dsr_prefix = True
 					cycle_count = 1
 				elif ins_code_int == 0xfecf:
 					# CPLC
