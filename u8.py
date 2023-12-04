@@ -60,12 +60,12 @@ class U8:
 
 		self.code_mem = rom
 
-		self.reset_ptr = self.read_cmem(2, 2)
-		self.reset_brk_ptr = self.read_cmem(4, 2)
+		self.reset_ptr = self.read_cmem(2)
+		self.reset_brk_ptr = self.read_cmem(4)
 
-		self.nmice_ptr = self.read_cmem(6, 2)
-		self.hwi_ptrs = [self.read_cmem(i, 2) for i in range(0xa, 0x7f, 2)]
-		self.swi_ptrs = [self.read_cmem(i, 2) for i in range(0x80, 0xff, 2)]
+		self.nmice_ptr = self.read_cmem(6)
+		self.hwi_ptrs = [self.read_cmem(i) for i in range(0xa, 0x7f, 2)]
+		self.swi_ptrs = [self.read_cmem(i) for i in range(0x80, 0xff, 2)]
 
 		self.ram = [0] * 0xe00
 		self.sfr_mem = [0] * 0x1000
@@ -89,9 +89,10 @@ class U8:
 		self.dsr_prefix = False
 		self.ea_inc_delay = 0
 		self.mask_cycle = 0
+		self.romwin_acc = 0
 
 	def reset(self) -> None:
-		self.sp.value = self.concat_bytes(self.code_mem[:2])
+		self.sp.value = self.read_cmem(0)
 		for i in range(16): self.gr.rs[i] = self.cr.rs[i] = 0
 		self.psw.raw = 0
 		self.pc.value = self.reset_ptr & 0xfffe
@@ -105,7 +106,7 @@ class U8:
 		self.ar.value = 0
 		self.dsr.value = 0
 
-	def read_cmem(self, addr: int, segment: int = 0):
+	def read_cmem(self, addr: int, segment: int = 0) -> int:
 		addr &= 0xfffe
 		segment &= 0xe
 		return int.from_bytes(self.code_mem[addr:addr+2], 'little')
@@ -117,7 +118,9 @@ class U8:
 		for i in range(addr, addr + bytes_to_fetch):
 			j = i % 0x10000
 			if segment == 0:
-				if j < 0x8000: fetched_bytes += self.code_mem[j].to_bytes(1, 'big')
+				if j < 0x8000:
+					fetched_bytes += self.code_mem[j].to_bytes(1, 'big')
+					self.romwin_acc += 1
 				if j < 0x8e00: fetched_bytes += self.ram[j - 0x8000].to_bytes(1, 'big')
 				elif j < 0xf000: fetched_bytes += b'\x00'
 				else: fetched_bytes += self.sfr_mem[j - 0xf000].to_bytes(1, 'big')
@@ -129,7 +132,7 @@ class U8:
 	def write_dmem(self, addr: int, bytes_to_write: bytes, segment: int = 0) -> None:
 		addr = addr % 0x10000
 
-		for i in range(bytes_to_write):
+		for i in range(len(bytes_to_write)):
 			j = (addr + i) % 0x10000
 			if segment == 0:
 				if j < 0x8000: return
@@ -168,6 +171,7 @@ class U8:
 	def err(self, msg): logging.error(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
 
 	def step(self) -> None:
+		self.pc.value &= 0xfffe
 		ins_code_int = self.read_cmem(self.pc.value, self.csr.value)
 		next_instruction = (self.pc.value + 2) & 0xfffe
 	
@@ -179,7 +183,7 @@ class U8:
 		immnum = ctypes.c_uint8(ins_code_raw[1]).value
 		adr = self.read_cmem(self.pc.value + 2, self.csr.value)
 
-		cycle_count = None
+		cycle_count = 0
 		ea_inc = False
 
 		retval = 0
@@ -268,6 +272,86 @@ class U8:
 				cycle_count = 1
 				retval = 2
 			else: retval = 1
+		elif decode_index == 0x90:
+			src = None
+			if ins_code_int & 0x10 == 0:
+				# L Rn, [ERm]
+				src = self.gr.ers[m]
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf0ff == 0x9010:
+				# L Rn, Dadr
+				next_instruction += 2
+				src = adr
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf0ff == 0x9030:
+				# L Rn, [EA]
+				src = self.ea.value
+			elif ins_code_int & 0xf0ff == 0x9050:
+				# L Rn, [EA+]
+				src = self.ea.value
+				self.ea.value += 1; ea_inc = True
+			else: retval = 1
+
+			if src is not None:
+				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)
+				self.dsr_prefix = False
+				cycle_count += 1 + self.romwin_acc
+
+				if val == 0: self.psw.z = 1
+				elif val > 0x7f: self.psw.s = 1
+				self.gr.rs[n] = val
+		elif decode_index == 0x91:
+			dest = None
+			if ins_code_int & 0x10 == 0:
+				# ST Rn, [ERm]
+				dest = self.gr.ers[m]
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf0ff == 0x9011:
+				# ST Rn, Dadr
+				next_instruction += 2
+				dest = adr
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf0ff == 0x9031:
+				# ST Rn, [EA]
+				dest = self.ea.value
+			elif ins_code_int & 0xf0ff == 0x9051:
+				# ST Rn, [EA+]
+				dest = self.ea.value
+				self.ea.value += 1; ea_inc = True
+			else: retval = 1
+
+			if dest is not None:
+				val = self.write_dmem(dest, self.gr[n].to_bytes(1, 'big'), self.dsr.value if self.dsr_prefix else 0)
+				self.dsr_prefix = False
+				cycle_count += 1
+		elif decode_index == 0x92:
+			src = None
+			if ins_code_int & 0x10 == 0:
+				# L ERn, [ERm]
+				src = self.gr.ers[m]
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf1ff == 0x9012:
+				# L ERn, Dadr
+				next_instruction += 2
+				src = adr
+				cycle_count += ea_inc_delay
+			elif ins_code_int & 0xf1ff == 0x9032:
+				# L ERn, [EA]
+				src = self.ea.value
+			elif ins_code_int & 0xf1ff == 0x9052:
+				# L ERn, [EA+]
+				src = self.ea.value
+				self.ea.value += 1; ea_inc = True
+			else: retval = 1
+
+			if src is not None:
+				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)[0]
+				self.dsr_prefix = False
+				cycle_count += 1 + self.romwin_acc
+
+				if val == 0: self.psw.z = 1
+				elif val > 0x7f: self.psw.s = 1
+				self.gr.ers[n] = val
 		elif decode_index == 0x9f:
 			if ins_code_int & 0xf00 != 0: retval = 1
 			else:
@@ -310,7 +394,7 @@ class U8:
 			elif cond_hex == 0xe: cond = True
 			else: retval = 1
 			if cond:
-				self.pc.value += immnum * 2
+				next_instruction += immnum * 2
 				cycle_count = 3
 			else: cycle_count = 1
 		elif ins_code[0] == 0xe:
@@ -431,7 +515,9 @@ class U8:
 			if ins_code_int & 0x10 != 0: retval = 1
 			else:
 				# LEA Dadr
-				retval = 2
+				self.ea.value = adr
+				next_instruction += 2
+				cycle_count = 2
 		elif decode_index == 0xfd:
 			# MOV CRn, [EA]
 			# MOV CRn, [EA+]
@@ -465,12 +551,12 @@ class U8:
 				elif ins_code_int == 0xfe2f:
 					# INC [EA]
 					seg = self.dsr.value if self.dsr_prefix else 0
-					currval = self.read_dmem(self.ea.value, 1, seg)
+					currval = self.read_dmem(self.ea.value, 1, seg)[0]
 					self.write_dmem(self.ea.value, (currval+1).to_bytes(1, 'big'), seg)
 				elif ins_code_int == 0xfe3f:
 					# DEC [EA]
 					seg = self.dsr.value if self.dsr_prefix else 0
-					currval = self.read_dmem(self.ea.value, 1, seg)
+					currval = self.read_dmem(self.ea.value, 1, seg)[0]
 					self.write_dmem(self.ea.value, (currval-1).to_bytes(1, 'big'), seg)
 				elif ins_code_int == 0xfe8f:
 					# NOP
@@ -516,7 +602,7 @@ class U8:
 		self.psw.field.c = int(result_raw & (0x10000 if short else 0xff))
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ self.psw.field.c
 		hc_val = 0xfff if short else 0xf
 		self.psw.field.hc = int((((op2 & hc_val) + (op1 & hc_val)) & (hc_val+1)))
 	
@@ -529,7 +615,7 @@ class U8:
 		self.psw.field.c = int(result_raw & 0xff)
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ self.psw.field.c
 		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
 		return result
@@ -551,7 +637,7 @@ class U8:
 		self.psw.field.c = int(result_raw & (0x10000 if short else 0xff))
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ self.psw.field.c
 		hc_val = 0xfff if short else 0xf
 		self.psw.field.hc = int((((op2 & hc_val) + (op1 & hc_val)) & (hc_val+1)))
 
@@ -564,7 +650,7 @@ class U8:
 		self.psw.field.c = int(result_raw & 0xff)
 		self.psw.field.z = int(result == 0)
 		self.psw.field.s = int(result < 0)
-		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ psw.field.c
+		self.psw.field.ov = (((op2 & 0x7f) + (op1 & 0x7f)) >> 7) ^ self.psw.field.c
 		self.psw.field.hc = int((((dest & 0xf) + (src & 0xf)) & 0x10))
 
 		return result
