@@ -171,9 +171,8 @@ class U8:
 	def err(self, msg): logging.error(f'{format(self.csr.value, "02X")}:{format(self.pc.value, "04X")}: {msg}')
 
 	def step(self) -> None:
-		self.pc.value &= 0xfffe
 		ins_code_int = self.read_cmem(self.pc.value, self.csr.value)
-		next_instruction = (self.pc.value + 2) & 0xfffe
+		self.pc.value = (self.pc.value + 2) & 0xfffe
 	
 		ins_code_raw = ins_code_int.to_bytes(2, 'big')
 		ins_code = self.conv_nibbs(ins_code_raw)
@@ -280,7 +279,7 @@ class U8:
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9010:
 				# L Rn, Dadr
-				next_instruction += 2
+				self.pc.value += 2
 				src = adr
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9030:
@@ -293,7 +292,7 @@ class U8:
 			else: retval = 1
 
 			if src is not None:
-				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)
+				val = self.read_dmem(src, 1, self.dsr.value if self.dsr_prefix else 0)[0]
 				self.dsr_prefix = False
 				cycle_count += 1 + self.romwin_acc
 
@@ -308,7 +307,7 @@ class U8:
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9011:
 				# ST Rn, Dadr
-				next_instruction += 2
+				self.pc.value += 2
 				dest = adr
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf0ff == 0x9031:
@@ -332,7 +331,7 @@ class U8:
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf1ff == 0x9012:
 				# L ERn, Dadr
-				next_instruction += 2
+				self.pc.value += 2
 				src = adr
 				cycle_count += ea_inc_delay
 			elif ins_code_int & 0xf1ff == 0x9032:
@@ -394,7 +393,7 @@ class U8:
 			elif cond_hex == 0xe: cond = True
 			else: retval = 1
 			if cond:
-				next_instruction += immnum * 2
+				self.pc.value += immnum * 2
 				cycle_count = 3
 			else: cycle_count = 1
 		elif ins_code[0] == 0xe:
@@ -455,7 +454,7 @@ class U8:
 			if ins_code_int & 0xf0 != 0: retval = 1
 			else:
 				# BL Cadr
-				self.lr.value = next_instruction + 2
+				self.lr.value = self.pc.value + 2
 				self.lcsr.value = self.csr.value
 				self.csr.value = ins_code[1]
 				self.pc.value = adr
@@ -471,7 +470,7 @@ class U8:
 			else:
 				# BL ERn
 				self.pc.value = self.gr.ers[m//2]
-				self.lr.value = next_instruction
+				self.lr.value = self.pc.value
 				self.lcsr.value = self.csr.value
 				cycle_count = 2 + self.ea_inc_delay
 		elif decode_index == 0xf4:
@@ -516,7 +515,7 @@ class U8:
 			else:
 				# LEA Dadr
 				self.ea.value = adr
-				next_instruction += 2
+				self.pc.value += 2
 				cycle_count = 2
 		elif decode_index == 0xfd:
 			# MOV CRn, [EA]
@@ -573,7 +572,7 @@ class U8:
 					# BRK
 					if self.psw.field.elevel > 1: self.reset_registers()
 					else:
-						self.elr2.value = next_instruction
+						self.elr2.value = self.pc.value
 						self.ecsr2.value = self.csr.value
 						self.epsw2 = self.psw.raw
 						self.psw.field.elevel = 2
@@ -590,7 +589,6 @@ class U8:
 
 			if self.dsr_prefix and self.mask_cycle == 0: self.mask_cycle += 1
 
-		self.pc.value = next_instruction
 		return retval
 
 	def add(self, op1: int, op2: int, short: bool = False):
