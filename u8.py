@@ -589,6 +589,7 @@ class U8:
 
 			if self.dsr_prefix and self.mask_cycle == 0: self.mask_cycle += 1
 
+		self.pc.value &= 0xfffe
 		return retval
 
 	def add(self, op1: int, op2: int, short: bool = False):
