@@ -358,6 +358,15 @@ class U8:
 				self.dsr.value = self.gr.rs[m]
 				dsr_prefix = True
 				cycle_count = 1
+		elif decode_index == 0xa1:
+			bit = n & 0x7
+			if ins_code_int & 0x80 != 0:
+				if ins_code_int & 0xf80 != 0x80: retval = 1
+				else:
+					# TB Dbitadr
+					byte = self.read_dmem(adr, 1, self.dsr.value if self.dsr_prefix else 0)
+			else:
+
 		elif ins_code[0] == 0xc:
 			cond = False
 			cond_hex = ins_code[1]
@@ -393,7 +402,7 @@ class U8:
 			elif cond_hex == 0xe: cond = True
 			else: retval = 1
 			if cond:
-				self.pc.value += immnum * 2
+				self.pc.value += ctypes.c_int8(immnum).value * 2
 				cycle_count = 3
 			else: cycle_count = 1
 		elif ins_code[0] == 0xe:
@@ -515,7 +524,7 @@ class U8:
 			else:
 				# LEA Dadr
 				self.ea.value = adr
-				self.pc.value += 2
+				self.pc.value = self.pc2
 				cycle_count = 2
 		elif decode_index == 0xfd:
 			# MOV CRn, [EA]
